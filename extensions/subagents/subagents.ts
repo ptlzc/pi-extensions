@@ -525,6 +525,9 @@ async function runPiOnce(
 
   return new Promise<PiRunResult>((resolve) => {
     const invocation = getPiInvocation(args);
+    console.error(
+      `[subagents] spawn: ${invocation.command} ${invocation.args.map((a) => a.includes(" ") ? `"${a}"` : a).join(" ")}`,
+    );
     const proc = spawn(invocation.command, invocation.args, {
       cwd,
       shell: false,
@@ -647,6 +650,9 @@ async function runCliOnce(
   );
 
   return new Promise<PiRunResult>((resolve) => {
+    console.error(
+      `[subagents] spawn: ${runtime.command} ${args.map((a) => a.includes(" ") ? `"${a}"` : a).join(" ")}`,
+    );
     const proc = spawn(runtime.command!, args, {
       cwd: agentCwd,
       shell: false,
