@@ -517,6 +517,7 @@ async function runParallel(
   configPath: string | null,
   signal: AbortSignal | undefined,
   onUpdate: ((index: number, text: string) => void) | undefined,
+  onComplete: ((index: number, result: SubagentResult) => void) | undefined,
   maxConcurrency = 4,
 ): Promise<SubagentResult[]> {
   const results = new Array<SubagentResult>(items.length);
@@ -541,6 +542,7 @@ async function runParallel(
             error: `Unknown agent: "${agentName}". Available: ${config.subagents.map((a) => a.name).join(", ") || "none"}`,
             durationMs: 0,
           };
+          onComplete?.(i, results[i]);
           continue;
         }
 
@@ -566,6 +568,7 @@ async function runParallel(
             (text) => onUpdate?.(i, text),
           );
         }
+        onComplete?.(i, results[i]);
       }
     });
 
@@ -742,6 +745,8 @@ export default async function (pi: ExtensionAPI) {
 
       // Parallel mode
       const tasks = params.tasks!.slice(0, 8);
+      // Shared progress state — populated by runParallel as results complete
+      const progress: (SubagentResult | undefined)[] = new Array(tasks.length).fill(undefined);
       const results = await runParallel(
         tasks,
         config,
@@ -749,19 +754,15 @@ export default async function (pi: ExtensionAPI) {
         configPath,
         signal,
         (index, text) => {
-          const status = results[index]
-            ? results[index].success
-              ? "✓"
-              : "✗"
-            : "⏳";
           onUpdate?.({
             content: [
               {
                 type: "text",
                 text: tasks
                   .map((t, i) => {
-                    const s = results[i]
-                      ? results[i].success
+                    const r = progress[i];
+                    const s = r
+                      ? r.success
                         ? "✓"
                         : "✗"
                       : i === index
@@ -773,6 +774,9 @@ export default async function (pi: ExtensionAPI) {
               },
             ],
           });
+        },
+        (index, result) => {
+          progress[index] = result;
         },
       );
 
