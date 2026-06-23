@@ -7,6 +7,7 @@ A collection of [Pi](https://pi.dev) coding agent extensions.
 | Extension | Description |
 |-----------|-------------|
 | [filter-skills](./extensions/filter-skills/) | Project-level skill filtering — disable user-level skills per project |
+| [subagents](./extensions/subagents/) | Configurable multi-subagent — pi-type and cli-type (devin/codex) with model fallback |
 
 ## Install
 

@@ -1,0 +1,12 @@
+{
+  "name": "@ptlzc/pi-subagents",
+  "version": "0.1.0",
+  "description": "Configurable multi-subagent extension for Pi — pi-type and cli-type subagents with model fallback",
+  "keywords": ["pi-package", "pi-extension"],
+  "license": "MIT",
+  "type": "module",
+  "main": "subagents.ts",
+  "pi": {
+    "extensions": ["./subagents.ts"]
+  }
+}

@@ -5,7 +5,7 @@ This repo hosts Pi coding agent extensions.
 ## Structure
 
 - `extensions/<name>/` — each extension is a self-contained directory
-- `extensions/<name>/filter-skills.ts` — extension entry point (TS module)
+- `extensions/<name>/<name>.ts` — extension entry point (TS module)
 - `extensions/<name>/package.json` — npm metadata with `pi` manifest
 - `extensions/<name>/README.md` — extension-specific docs
 

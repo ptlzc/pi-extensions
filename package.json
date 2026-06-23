@@ -5,6 +5,9 @@
   "keywords": ["pi-package"],
   "license": "MIT",
   "pi": {
-    "extensions": ["./extensions/filter-skills"]
+    "extensions": [
+      "./extensions/filter-skills",
+      "./extensions/subagents"
+    ]
   }
 }
