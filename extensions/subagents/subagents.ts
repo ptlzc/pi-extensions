@@ -219,10 +219,10 @@ async function runPiOnce(
   if (agent.tools && agent.tools.length > 0) {
     args.push("--tools", agent.tools.join(","));
   }
-  const maxTokens = agent.max_tokens ?? defaults.max_tokens;
-  if (maxTokens) {
-    args.push("--max-tokens", String(maxTokens));
-  }
+  // Note: pi doesn't have a --max-tokens CLI flag; max_tokens is configured
+  // per-model in models.json. The max_tokens config field is reserved for
+  // future use when pi adds CLI support or for documentation purposes.
+  // const maxTokens = agent.max_tokens ?? defaults.max_tokens;
 
   let tmpDir: string | null = null;
   if (systemPrompt.trim()) {
