@@ -5,7 +5,8 @@
   "keywords": ["pi-package"],
   "license": "MIT",
   "dependencies": {
-    "yaml": "^2.9.0"
+    "yaml": "^2.9.0",
+    "nunjucks": "^3.2.4"
   },
   "pi": {
     "extensions": [

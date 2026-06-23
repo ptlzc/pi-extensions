@@ -1,18 +1,20 @@
 /**
  * subagents — Configurable multi-subagent extension for Pi
  *
- * Supports two subagent types:
- *   - type: pi  — spawns a pi subprocess with isolated context, specific model/tools/prompt
- *   - type: cli — spawns an external CLI command (e.g. devin, codex, aider)
- *
  * Features:
- *   - Model fallback for pi-type subagents
- *   - Prompt templates (inline or from file)
- *   - Parallel execution
- *   - Template variables in CLI args ({task}, {cwd}, {agent_name})
- *   - Project-level YAML config in .pi/subagents.yaml
+ *   - Two subagent types: pi (isolated pi subprocess) and cli (external command)
+ *   - Fallback = complete subagent definitions (not just models)
+ *   - Prompt files: .md (plain) or .j2 (Jinja2 with input validation)
+ *   - Template variables in CLI args: {task}, {cwd}, {agent_name}
+ *   - Parallel execution (max 8, 4 concurrent)
+ *   - Thinking level support for pi-type
+ *   - Project-level config in .pi/subagents/config.yaml
  *
- * Config: .pi/subagents.yaml or .pi/subagents.json
+ * Config directory: .pi/subagents/
+ *   ├── config.yaml
+ *   └── prompts/
+ *       ├── scout.md
+ *       └── reviewer.j2
  */
 
 import { spawn } from "node:child_process";
@@ -22,9 +24,10 @@ import {
   mkdtempSync,
   writeFileSync,
   rmSync,
+  readdirSync,
   statSync,
 } from "node:fs";
-import { join, resolve, dirname, basename } from "node:path";
+import { join, resolve, dirname, basename, extname } from "node:path";
 import { tmpdir } from "node:os";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -34,18 +37,49 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 // ---------------------------------------------------------------------------
 
 type SubagentType = "pi" | "cli";
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+interface J2InputSpec {
+  name: string;
+  type: "string" | "number" | "boolean" | "array" | "object";
+  required?: boolean;
+  default?: unknown;
+}
 
 interface SubagentConfig {
   name: string;
   description: string;
   type: SubagentType;
+
+  // Prompt
+  prompt?: string; // inline text or file path relative to .pi/subagents/
+  prompt_input?: Record<string, unknown>; // input for j2 rendering
+
   // Pi-type
   model?: string;
-  fallback_models?: string[];
+  thinking?: ThinkingLevel;
+  max_context?: number;
   tools?: string[];
-  system_prompt?: string;
-  system_prompt_file?: string;
-  max_tokens?: number;
+
+  // CLI-type
+  command?: string;
+  args?: string[];
+  timeout?: number;
+  cwd?: string;
+
+  // Fallback = complete subagent definitions
+  fallback?: FallbackConfig[];
+}
+
+interface FallbackConfig {
+  type: SubagentType;
+  // Pi-type
+  model?: string;
+  thinking?: ThinkingLevel;
+  max_context?: number;
+  tools?: string[];
+  prompt?: string;
+  prompt_input?: Record<string, unknown>;
   // CLI-type
   command?: string;
   args?: string[];
@@ -57,8 +91,21 @@ interface SubagentsConfig {
   subagents: SubagentConfig[];
   defaults?: {
     timeout?: number;
-    max_tokens?: number;
+    thinking?: ThinkingLevel;
   };
+}
+
+interface SubagentRuntime {
+  type: SubagentType;
+  model?: string;
+  thinking?: ThinkingLevel;
+  max_context?: number;
+  tools?: string[];
+  systemPrompt: string;
+  command?: string;
+  args?: string[];
+  timeout?: number;
+  cwd?: string;
 }
 
 interface SubagentResult {
@@ -68,32 +115,24 @@ interface SubagentResult {
   output: string;
   error?: string;
   model?: string;
+  thinking?: ThinkingLevel;
   turns?: number;
   durationMs: number;
+  attempt: number;
+  totalAttempts: number;
 }
 
 // ---------------------------------------------------------------------------
-// Config loading
+// Config directory discovery
 // ---------------------------------------------------------------------------
 
-async function loadYaml(): Promise<typeof import("yaml") | null> {
-  try {
-    return await import("yaml");
-  } catch {
-    return null;
-  }
-}
-
-function findConfigFile(cwd: string): string | null {
-  // Walk up from cwd looking for .pi/subagents.yaml or .pi/subagents.json
+function findSubagentsDir(cwd: string): string | null {
   let dir = cwd;
   for (let i = 0; i < 20; i++) {
-    const yamlPath = join(dir, ".pi", "subagents.yaml");
-    const ymlPath = join(dir, ".pi", "subagents.yml");
-    const jsonPath = join(dir, ".pi", "subagents.json");
-    if (existsSync(yamlPath)) return yamlPath;
-    if (existsSync(ymlPath)) return ymlPath;
-    if (existsSync(jsonPath)) return jsonPath;
+    const candidate = join(dir, ".pi", "subagents");
+    if (existsSync(candidate) && statSync(candidate).isDirectory()) {
+      return candidate;
+    }
     const parent = dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -101,10 +140,46 @@ function findConfigFile(cwd: string): string | null {
   return null;
 }
 
-async function loadConfig(cwd: string): Promise<SubagentsConfig> {
-  const configPath = findConfigFile(cwd);
-  if (!configPath) return { subagents: [] };
+function findConfigFile(subagentsDir: string): string | null {
+  for (const name of ["config.yaml", "config.yml", "config.json"]) {
+    const p = join(subagentsDir, name);
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
 
+// ---------------------------------------------------------------------------
+// YAML loading
+// ---------------------------------------------------------------------------
+
+let yamlModule: typeof import("yaml") | null | undefined;
+
+async function getYaml(): Promise<typeof import("yaml") | null> {
+  if (yamlModule !== undefined) return yamlModule;
+  try {
+    yamlModule = await import("yaml");
+  } catch {
+    yamlModule = null;
+  }
+  return yamlModule;
+}
+
+let nunjucksModule: typeof import("nunjucks") | null | undefined;
+
+async function getNunjucks(): Promise<typeof import("nunjucks") | null> {
+  if (nunjucksModule !== undefined) return nunjucksModule;
+  try {
+    nunjucksModule = await import("nunjucks");
+  } catch {
+    nunjucksModule = null;
+  }
+  return nunjucksModule;
+}
+
+async function loadConfig(
+  subagentsDir: string,
+  configPath: string,
+): Promise<SubagentsConfig> {
   const raw = readFileSync(configPath, "utf-8");
 
   if (configPath.endsWith(".json")) {
@@ -116,16 +191,12 @@ async function loadConfig(cwd: string): Promise<SubagentsConfig> {
     }
   }
 
-  const yaml = await loadYaml();
+  const yaml = await getYaml();
   if (!yaml) {
     console.error(
-      `[subagents] Found ${configPath} but js-yaml/yaml is not installed. Using JSON config instead.`,
+      `[subagents] Found ${configPath} but yaml package is not installed.`,
     );
-    try {
-      return JSON.parse(raw) as SubagentsConfig;
-    } catch {
-      return { subagents: [] };
-    }
+    return { subagents: [] };
   }
 
   try {
@@ -136,28 +207,193 @@ async function loadConfig(cwd: string): Promise<SubagentsConfig> {
   }
 }
 
-function resolveSystemPrompt(
-  agent: SubagentConfig,
-  configPath: string | null,
-): string {
-  if (agent.system_prompt) {
-    return agent.system_prompt;
+// ---------------------------------------------------------------------------
+// Prompt loading and Jinja2 rendering
+// ---------------------------------------------------------------------------
+
+interface ParsedJ2Template {
+  inputs: J2InputSpec[];
+  template: string;
+}
+
+function parseJ2Frontmatter(content: string): ParsedJ2Template {
+  const frontmatterRegex = /^---\n([\s\S]*?)\n---\n([\s\S]*)$/;
+  const match = content.match(frontmatterRegex);
+
+  if (!match) {
+    // No frontmatter — treat entire content as template, no input validation
+    return { inputs: [], template: content };
   }
-  if (agent.system_prompt_file) {
-    const basePath = configPath ? dirname(configPath) : process.cwd();
-    const promptPath = resolve(basePath, agent.system_prompt_file);
-    if (existsSync(promptPath)) {
-      return readFileSync(promptPath, "utf-8");
+
+  const frontmatterRaw = match[1];
+  const template = match[2];
+  const inputs: J2InputSpec[] = [];
+
+  // Parse simple YAML-like frontmatter for inputs
+  const yaml = getYamlSync();
+  if (yaml) {
+    try {
+      const fm = yaml.parse(frontmatterRaw) as Record<string, unknown>;
+      if (fm.inputs && Array.isArray(fm.inputs)) {
+        for (const inp of fm.inputs as Record<string, unknown>[]) {
+          if (inp.name && inp.type) {
+            inputs.push({
+              name: String(inp.name),
+              type: inp.type as J2InputSpec["type"],
+              required: inp.required as boolean | undefined,
+              default: inp.default,
+            });
+          }
+        }
+      }
+    } catch {
+      // Fall through to empty inputs
     }
-    console.error(
-      `[subagents] system_prompt_file not found: ${promptPath}`,
-    );
   }
-  return "";
+
+  return { inputs, template };
+}
+
+let yamlSync: typeof import("yaml") | null | undefined;
+
+function getYamlSync(): typeof import("yaml") | null {
+  if (yamlSync !== undefined) return yamlSync;
+  try {
+    // require() for sync access
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    yamlSync = require("yaml");
+  } catch {
+    yamlSync = null;
+  }
+  return yamlSync;
+}
+
+function validatePromptInput(
+  inputs: J2InputSpec[],
+  provided: Record<string, unknown> | undefined,
+  agentName: string,
+): string[] {
+  const errors: string[] = [];
+  const providedMap = provided ?? {};
+
+  for (const spec of inputs) {
+    const value = providedMap[spec.name];
+
+    if (value === undefined || value === null) {
+      if (spec.required && spec.default === undefined) {
+        errors.push(
+          `[subagents] Agent "${agentName}": missing required input "${spec.name}" (type: ${spec.type})`,
+        );
+      }
+      continue;
+    }
+
+    // Type validation
+    const actualType = Array.isArray(value)
+      ? "array"
+      : typeof value === "object"
+        ? "object"
+        : typeof value;
+
+    if (actualType !== spec.type) {
+      errors.push(
+        `[subagents] Agent "${agentName}": input "${spec.name}" expected type "${spec.type}", got "${actualType}"`,
+      );
+    }
+  }
+
+  return errors;
+}
+
+function applyDefaults(
+  inputs: J2InputSpec[],
+  provided: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const result = { ...(provided ?? {}) };
+  for (const spec of inputs) {
+    if (
+      (result[spec.name] === undefined || result[spec.name] === null) &&
+      spec.default !== undefined
+    ) {
+      result[spec.name] = spec.default;
+    }
+  }
+  return result;
+}
+
+async function renderJ2Template(
+  template: string,
+  input: Record<string, unknown>,
+  agentName: string,
+): Promise<string> {
+  const nunjucks = await getNunjucks();
+  if (!nunjucks) {
+    console.error(
+      `[subagents] Agent "${agentName}": .j2 prompt requires nunjucks package. Install with: npm i nunjucks`,
+    );
+    // Fall back to raw template (variables will be undefined)
+    return template;
+  }
+
+  try {
+    return nunjucks.renderString(template, input);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[subagents] Agent "${agentName}": Jinja2 render error: ${msg}`,
+    );
+    return template;
+  }
+}
+
+async function resolvePrompt(
+  promptConfig: string | undefined,
+  promptInput: Record<string, unknown> | undefined,
+  subagentsDir: string,
+  agentName: string,
+): Promise<string> {
+  if (!promptConfig) {
+    return "";
+  }
+
+  // Check if it's a file path (relative to .pi/subagents/)
+  const promptPath = resolve(subagentsDir, promptConfig);
+  let content: string;
+  let isFile = false;
+
+  if (existsSync(promptPath) && statSync(promptPath).isFile()) {
+    content = readFileSync(promptPath, "utf-8");
+    isFile = true;
+  } else {
+    // Treat as inline prompt text
+    content = promptConfig;
+  }
+
+  // Determine if it's a .j2 template
+  const isJ2 = isFile && extname(promptPath) === ".j2";
+
+  if (!isJ2) {
+    // Plain markdown — return as-is
+    return content;
+  }
+
+  // Parse j2 frontmatter and validate input
+  const { inputs, template } = parseJ2Frontmatter(content);
+
+  if (inputs.length > 0) {
+    const errors = validatePromptInput(inputs, promptInput, agentName);
+    if (errors.length > 0) {
+      for (const e of errors) console.error(e);
+      // Still try to render with what we have
+    }
+  }
+
+  const inputWithDefaults = applyDefaults(inputs, promptInput);
+  return renderJ2Template(template, inputWithDefaults, agentName);
 }
 
 // ---------------------------------------------------------------------------
-// Template substitution
+// Template substitution for CLI args
 // ---------------------------------------------------------------------------
 
 function substituteTemplate(
@@ -172,10 +408,43 @@ function substituteTemplate(
 }
 
 // ---------------------------------------------------------------------------
-// Pi subagent runner (with model fallback)
+// Build runtime config from SubagentConfig or FallbackConfig
 // ---------------------------------------------------------------------------
 
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
+async function buildRuntime(
+  config: SubagentConfig | FallbackConfig,
+  name: string,
+  subagentsDir: string,
+  defaults: { timeout?: number; thinking?: ThinkingLevel },
+): Promise<SubagentRuntime> {
+  const prompt = await resolvePrompt(
+    config.prompt,
+    config.prompt_input,
+    subagentsDir,
+    name,
+  );
+
+  return {
+    type: config.type,
+    model: config.model,
+    thinking: config.thinking ?? defaults.thinking,
+    max_context: config.max_context,
+    tools: config.tools,
+    systemPrompt: prompt,
+    command: config.command,
+    args: config.args,
+    timeout: config.timeout,
+    cwd: config.cwd,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Pi subagent runner
+// ---------------------------------------------------------------------------
+
+function getPiInvocation(
+  args: string[],
+): { command: string; args: string[] } {
   const currentScript = process.argv[1];
   if (currentScript && existsSync(currentScript)) {
     return { command: process.execPath, args: [currentScript, ...args] };
@@ -199,34 +468,38 @@ interface PiRunResult {
   output: string;
   stderr: string;
   model: string;
+  thinking?: ThinkingLevel;
   turns: number;
   stopReason?: string;
   errorMessage?: string;
 }
 
 async function runPiOnce(
-  agent: SubagentConfig,
-  model: string,
+  runtime: SubagentRuntime,
   task: string,
   cwd: string,
-  systemPrompt: string,
-  defaults: { max_tokens?: number },
   signal: AbortSignal | undefined,
   onUpdate: ((text: string) => void) | undefined,
 ): Promise<PiRunResult> {
   const args: string[] = ["--mode", "json", "-p", "--no-session"];
-  args.push("--model", model);
-  if (agent.tools && agent.tools.length > 0) {
-    args.push("--tools", agent.tools.join(","));
+
+  if (runtime.model) {
+    // Support "provider/model:thinking" syntax
+    const thinkingSuffix = runtime.thinking && runtime.thinking !== "off"
+      ? `:${runtime.thinking}`
+      : "";
+    args.push("--model", `${runtime.model}${thinkingSuffix}`);
+  } else if (runtime.thinking && runtime.thinking !== "off") {
+    args.push("--thinking", runtime.thinking);
   }
-  // Note: pi doesn't have a --max-tokens CLI flag; max_tokens is configured
-  // per-model in models.json. The max_tokens config field is reserved for
-  // future use when pi adds CLI support or for documentation purposes.
-  // const maxTokens = agent.max_tokens ?? defaults.max_tokens;
+
+  if (runtime.tools && runtime.tools.length > 0) {
+    args.push("--tools", runtime.tools.join(","));
+  }
 
   let tmpDir: string | null = null;
-  if (systemPrompt.trim()) {
-    const tmp = writePromptToTempFile(agent.name, systemPrompt);
+  if (runtime.systemPrompt.trim()) {
+    const tmp = writePromptToTempFile("subagent", runtime.systemPrompt);
     tmpDir = tmp.dir;
     args.push("--append-system-prompt", tmp.filePath);
   }
@@ -258,7 +531,6 @@ async function runPiOnce(
 
     proc.stdout.on("data", (data: Buffer) => {
       stdout += data.toString();
-      // Process complete JSON lines
       const lines = stdout.split("\n");
       stdout = lines.pop() ?? "";
       for (const line of lines) {
@@ -303,7 +575,8 @@ async function runPiOnce(
         exitCode: code ?? 1,
         output: lastAssistantText,
         stderr,
-        model,
+        model: runtime.model ?? "default",
+        thinking: runtime.thinking,
         turns,
         stopReason,
         errorMessage,
@@ -317,7 +590,8 @@ async function runPiOnce(
         exitCode: 1,
         output: "",
         stderr: err.message,
-        model,
+        model: runtime.model ?? "default",
+        thinking: runtime.thinking,
         turns: 0,
         errorMessage: err.message,
       });
@@ -325,116 +599,38 @@ async function runPiOnce(
   });
 }
 
-async function runPiSubagent(
-  agent: SubagentConfig,
-  task: string,
-  cwd: string,
-  systemPrompt: string,
-  defaults: { max_tokens?: number },
-  signal: AbortSignal | undefined,
-  onUpdate: ((text: string) => void) | undefined,
-): Promise<SubagentResult> {
-  const start = Date.now();
-  const models = [agent.model, ...(agent.fallback_models ?? [])].filter(
-    Boolean,
-  ) as string[];
-
-  if (models.length === 0) {
-    return {
-      agent: agent.name,
-      task,
-      success: false,
-      output: "",
-      error: "No model configured for pi-type subagent",
-      durationMs: Date.now() - start,
-    };
-  }
-
-  let lastError = "";
-  for (const model of models) {
-    const result = await runPiOnce(
-      agent,
-      model,
-      task,
-      cwd,
-      systemPrompt,
-      defaults,
-      signal,
-      onUpdate,
-    );
-
-    const failed =
-      result.exitCode !== 0 ||
-      result.stopReason === "error" ||
-      result.stopReason === "aborted";
-
-    if (!failed) {
-      return {
-        agent: agent.name,
-        task,
-        success: true,
-        output: result.output || "(no output)",
-        model: result.model,
-        turns: result.turns,
-        durationMs: Date.now() - start,
-      };
-    }
-
-    lastError =
-      result.errorMessage || result.stderr || result.output || "Unknown error";
-    console.error(
-      `[subagents] Agent "${agent.name}" model "${model}" failed: ${lastError}`,
-    );
-
-    if (result.stopReason === "aborted") {
-      // User abort — don't try fallback
-      break;
-    }
-  }
-
-  return {
-    agent: agent.name,
-    task,
-    success: false,
-    output: "",
-    error: `All models failed. Last error: ${lastError}`,
-    model: models[models.length - 1],
-    durationMs: Date.now() - start,
-  };
-}
-
 // ---------------------------------------------------------------------------
 // CLI subagent runner
 // ---------------------------------------------------------------------------
 
-async function runCliSubagent(
-  agent: SubagentConfig,
+async function runCliOnce(
+  runtime: SubagentRuntime,
   task: string,
   cwd: string,
   defaultTimeout: number,
   signal: AbortSignal | undefined,
   onUpdate: ((text: string) => void) | undefined,
-): Promise<SubagentResult> {
-  const start = Date.now();
-
-  if (!agent.command) {
+): Promise<PiRunResult> {
+  if (!runtime.command) {
     return {
-      agent: agent.name,
-      task,
-      success: false,
+      exitCode: 1,
       output: "",
-      error: "No command configured for cli-type subagent",
-      durationMs: Date.now() - start,
+      stderr: "No command configured",
+      model: "cli",
+      turns: 0,
+      errorMessage: "No command configured for cli-type subagent",
     };
   }
 
-  const timeout = (agent.timeout ?? defaultTimeout) * 1000;
-  const agentCwd = agent.cwd ? resolve(cwd, agent.cwd) : cwd;
-  const vars = { task, cwd: agentCwd, agent_name: agent.name };
-  const args = (agent.args ?? []).map((a) => substituteTemplate(a, vars));
+  const timeout = (runtime.timeout ?? defaultTimeout) * 1000;
+  const agentCwd = runtime.cwd ? resolve(cwd, runtime.cwd) : cwd;
+  const vars = { task, cwd: agentCwd, agent_name: "subagent" };
+  const args = (runtime.args ?? []).map((a) =>
+    substituteTemplate(a, vars),
+  );
 
-  return new Promise<SubagentResult>((resolve) => {
-    const proc = spawn(agent.command!, args, {
+  return new Promise<PiRunResult>((resolve) => {
+    const proc = spawn(runtime.command!, args, {
       cwd: agentCwd,
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
@@ -471,58 +667,179 @@ async function runCliSubagent(
     };
     signal?.addEventListener("abort", onAbort, { once: true });
 
-    const done = (result: SubagentResult) => {
+    const done = (result: PiRunResult) => {
       signal?.removeEventListener("abort", onAbort);
       if (timer) clearTimeout(timer);
       resolve(result);
     };
 
     proc.on("close", (code) => {
-      const success = code === 0 && !timedOut;
+      const failed = code !== 0 || timedOut;
       done({
-        agent: agent.name,
-        task,
-        success,
+        exitCode: code ?? 1,
         output: stdout.trim() || "(no output)",
-        error: !success
+        stderr,
+        model: "cli",
+        turns: 0,
+        stopReason: failed ? (timedOut ? "timeout" : "error") : undefined,
+        errorMessage: failed
           ? timedOut
             ? `Timed out after ${timeout / 1000}s`
             : stderr.trim() || `Exit code ${code}`
           : undefined,
-        durationMs: Date.now() - start,
       });
     });
 
     proc.on("error", (err) => {
       done({
-        agent: agent.name,
-        task,
-        success: false,
+        exitCode: 1,
         output: "",
-        error: err.message,
-        durationMs: Date.now() - start,
+        stderr: err.message,
+        model: "cli",
+        turns: 0,
+        errorMessage: err.message,
       });
     });
   });
 }
 
 // ---------------------------------------------------------------------------
-// Parallel execution helper
+// Run with fallback chain
+// ---------------------------------------------------------------------------
+
+async function runWithFallback(
+  primary: SubagentRuntime,
+  fallbacks: SubagentRuntime[],
+  agentName: string,
+  task: string,
+  cwd: string,
+  defaultTimeout: number,
+  signal: AbortSignal | undefined,
+  onUpdate: ((text: string) => void) | undefined,
+): Promise<SubagentResult> {
+  const start = Date.now();
+  const allRuntimes = [primary, ...fallbacks];
+  let lastError = "";
+
+  for (let i = 0; i < allRuntimes.length; i++) {
+    const rt = allRuntimes[i];
+    const isLast = i === allRuntimes.length - 1;
+
+    let result: PiRunResult;
+    if (rt.type === "cli") {
+      result = await runCliOnce(
+        rt,
+        task,
+        cwd,
+        defaultTimeout,
+        signal,
+        onUpdate,
+      );
+    } else {
+      result = await runPiOnce(rt, task, cwd, signal, onUpdate);
+    }
+
+    const failed =
+      result.exitCode !== 0 ||
+      result.stopReason === "error" ||
+      result.stopReason === "timeout" ||
+      result.stopReason === "aborted";
+
+    if (!failed) {
+      return {
+        agent: agentName,
+        task,
+        success: true,
+        output: result.output || "(no output)",
+        model: result.model,
+        thinking: result.thinking,
+        turns: result.turns,
+        durationMs: Date.now() - start,
+        attempt: i + 1,
+        totalAttempts: allRuntimes.length,
+      };
+    }
+
+    lastError =
+      result.errorMessage || result.stderr || result.output || "Unknown error";
+
+    const attemptDesc =
+      i === 0
+        ? `primary (${rt.type}${rt.model ? `:${rt.model}` : ""})`
+        : `fallback ${i} (${rt.type}${rt.model ? `:${rt.model}` : rt.command ? `:${rt.command}` : ""})`;
+    console.error(
+      `[subagents] Agent "${agentName}" ${attemptDesc} failed: ${lastError}`,
+    );
+
+    if (result.stopReason === "aborted") {
+      // User abort — don't try fallback
+      break;
+    }
+
+    if (isLast) {
+      // No more fallbacks
+      break;
+    }
+  }
+
+  return {
+    agent: agentName,
+    task,
+    success: false,
+    output: "",
+    error: `All ${allRuntimes.length} attempt(s) failed. Last error: ${lastError}`,
+    model: allRuntimes[allRuntimes.length - 1].model,
+    thinking: allRuntimes[allRuntimes.length - 1].thinking,
+    durationMs: Date.now() - start,
+    attempt: allRuntimes.length,
+    totalAttempts: allRuntimes.length,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Parallel execution
 // ---------------------------------------------------------------------------
 
 async function runParallel(
   items: { agent: string; task: string }[],
   config: SubagentsConfig,
-  cwd: string,
-  configPath: string | null,
+  subagentsDir: string,
+  defaults: { timeout?: number; thinking?: ThinkingLevel },
   signal: AbortSignal | undefined,
   onUpdate: ((index: number, text: string) => void) | undefined,
-  onComplete: ((index: number, result: SubagentResult) => void) | undefined,
+  onComplete:
+    | ((index: number, result: SubagentResult) => void)
+    | undefined,
   maxConcurrency = 4,
 ): Promise<SubagentResult[]> {
   const results = new Array<SubagentResult>(items.length);
   let nextIndex = 0;
-  const defaultTimeout = config.defaults?.timeout ?? 120;
+  const defaultTimeout = defaults.timeout ?? 120;
+
+  // Pre-build runtimes for all agents
+  const runtimeCache = new Map<
+    string,
+    { primary: SubagentRuntime; fallbacks: SubagentRuntime[] }
+  >();
+
+  for (const item of items) {
+    if (runtimeCache.has(item.agent)) continue;
+    const agent = config.subagents.find((a) => a.name === item.agent);
+    if (!agent) continue;
+    const primary = await buildRuntime(
+      agent,
+      agent.name,
+      subagentsDir,
+      defaults,
+    );
+    const fallbacks: SubagentRuntime[] = [];
+    for (const fb of agent.fallback ?? []) {
+      fallbacks.push(
+        await buildRuntime(fb, agent.name, subagentsDir, defaults),
+      );
+    }
+    runtimeCache.set(item.agent, { primary, fallbacks });
+  }
 
   const workers = new Array(Math.min(maxConcurrency, items.length))
     .fill(null)
@@ -531,9 +848,9 @@ async function runParallel(
         const i = nextIndex++;
         if (i >= items.length) return;
         const { agent: agentName, task } = items[i];
-        const agent = config.subagents.find((a) => a.name === agentName);
 
-        if (!agent) {
+        const cached = runtimeCache.get(agentName);
+        if (!cached) {
           results[i] = {
             agent: agentName,
             task,
@@ -541,33 +858,23 @@ async function runParallel(
             output: "",
             error: `Unknown agent: "${agentName}". Available: ${config.subagents.map((a) => a.name).join(", ") || "none"}`,
             durationMs: 0,
+            attempt: 0,
+            totalAttempts: 0,
           };
           onComplete?.(i, results[i]);
           continue;
         }
 
-        const systemPrompt = resolveSystemPrompt(agent, configPath);
-
-        if (agent.type === "cli") {
-          results[i] = await runCliSubagent(
-            agent,
-            task,
-            cwd,
-            defaultTimeout,
-            signal,
-            (text) => onUpdate?.(i, text),
-          );
-        } else {
-          results[i] = await runPiSubagent(
-            agent,
-            task,
-            cwd,
-            systemPrompt,
-            { max_tokens: config.defaults?.max_tokens },
-            signal,
-            (text) => onUpdate?.(i, text),
-          );
-        }
+        results[i] = await runWithFallback(
+          cached.primary,
+          cached.fallbacks,
+          agentName,
+          task,
+          process.cwd(),
+          defaultTimeout,
+          signal,
+          (text) => onUpdate?.(i, text),
+        );
         onComplete?.(i, results[i]);
       }
     });
@@ -583,11 +890,20 @@ async function runParallel(
 function formatResult(result: SubagentResult): string {
   const status = result.success ? "✓" : "✗";
   const model = result.model ? ` [${result.model}]` : "";
-  const turns = result.turns ? ` ${result.turns} turn${result.turns > 1 ? "s" : ""}` : "";
+  const thinking = result.thinking && result.thinking !== "off"
+    ? ` thinking:${result.thinking}`
+    : "";
+  const turns = result.turns
+    ? ` ${result.turns} turn${result.turns > 1 ? "s" : ""}`
+    : "";
   const duration = ` ${(result.durationMs / 1000).toFixed(1)}s`;
+  const attempts =
+    result.totalAttempts > 1
+      ? ` ${result.attempt}/${result.totalAttempts} attempts`
+      : "";
 
   if (!result.success) {
-    return `${status} ${result.agent}${model}${turns}${duration}\n  Error: ${result.error}`;
+    return `${status} ${result.agent}${model}${thinking}${turns}${duration}${attempts}\n  Error: ${result.error}`;
   }
 
   const output =
@@ -596,7 +912,7 @@ function formatResult(result: SubagentResult): string {
         `\n\n[Output truncated: ${result.output.length - 8000} chars omitted]`
       : result.output;
 
-  return `${status} ${result.agent}${model}${turns}${duration}\n${output}`;
+  return `${status} ${result.agent}${model}${thinking}${turns}${duration}${attempts}\n${output}`;
 }
 
 function formatResults(results: SubagentResult[]): string {
@@ -628,37 +944,69 @@ const SubagentParams = Type.Object({
   ),
   tasks: Type.Optional(
     Type.Array(TaskItem, {
-      description: "Array of {agent, task} for parallel execution (max 8, 4 concurrent)",
+      description:
+        "Array of {agent, task} for parallel execution (max 8, 4 concurrent)",
     }),
   ),
 });
 
 export default async function (pi: ExtensionAPI) {
-  // Preload yaml parser
-  await loadYaml();
+  // Preload yaml and nunjucks
+  await getYaml();
+  await getNunjucks();
 
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
     description: [
       "Delegate tasks to specialized subagents with isolated context.",
-      "Supports pi-type (spawn pi with model/tools/prompt) and cli-type (spawn external command like devin/codex).",
+      "Supports pi-type (spawn pi with model/thinking/tools/prompt) and cli-type (spawn external command like devin/codex).",
+      "Each subagent can have fallback subagents (complete definitions, not just models).",
+      "Prompt files: .md (plain) or .j2 (Jinja2 with input validation).",
       "Modes: single (agent + task), parallel (tasks array).",
-      "Configure subagents in .pi/subagents.yaml.",
+      "Configure in .pi/subagents/config.yaml.",
     ].join(" "),
 
     parameters: SubagentParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const config = await loadConfig(ctx.cwd);
-      const configPath = findConfigFile(ctx.cwd);
+      const subagentsDir = findSubagentsDir(ctx.cwd);
+
+      if (!subagentsDir) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "No subagents directory found. Create .pi/subagents/config.yaml with subagent definitions.\nSee: https://github.com/ptlzc/pi-extensions/tree/main/extensions/subagents",
+            },
+          ],
+        };
+      }
+
+      const configPath = findConfigFile(subagentsDir);
+      if (!configPath) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Found ${subagentsDir} but no config.yaml/config.json. Create .pi/subagents/config.yaml.\nSee: https://github.com/ptlzc/pi-extensions/tree/main/extensions/subagents`,
+            },
+          ],
+        };
+      }
+
+      const config = await loadConfig(subagentsDir, configPath);
+      const defaults = {
+        timeout: config.defaults?.timeout ?? 120,
+        thinking: config.defaults?.thinking,
+      };
 
       if (config.subagents.length === 0) {
         return {
           content: [
             {
               type: "text",
-              text: "No subagents configured. Create .pi/subagents.yaml with subagent definitions.\nSee: https://github.com/ptlzc/pi-extensions/tree/main/extensions/subagents",
+              text: `No subagents configured in ${configPath}.`,
             },
           ],
         };
@@ -669,10 +1017,14 @@ export default async function (pi: ExtensionAPI) {
 
       if (!hasTasks && !hasSingle) {
         const available = config.subagents
-          .map(
-            (a) =>
-              `"${a.name}" (${a.type}${a.model ? `:${a.model}` : ""}): ${a.description}`,
-          )
+          .map((a) => {
+            const parts = [a.type];
+            if (a.model) parts.push(a.model);
+            if (a.thinking && a.thinking !== "off") parts.push(`thinking:${a.thinking}`);
+            const fbCount = a.fallback?.length ?? 0;
+            if (fbCount > 0) parts.push(`${fbCount} fallback(s)`);
+            return `"${a.name}" (${parts.join(", ")}): ${a.description}`;
+          })
           .join("\n  ");
         return {
           content: [
@@ -691,7 +1043,8 @@ export default async function (pi: ExtensionAPI) {
         const agent = config.subagents.find((a) => a.name === agentName);
 
         if (!agent) {
-          const available = config.subagents.map((a) => `"${a.name}"`).join(", ") || "none";
+          const available =
+            config.subagents.map((a) => `"${a.name}"`).join(", ") || "none";
           return {
             content: [
               {
@@ -702,36 +1055,32 @@ export default async function (pi: ExtensionAPI) {
           };
         }
 
-        const systemPrompt = resolveSystemPrompt(agent, configPath);
-        const defaultTimeout = config.defaults?.timeout ?? 120;
-
-        let result: SubagentResult;
-        if (agent.type === "cli") {
-          result = await runCliSubagent(
-            agent,
-            task,
-            ctx.cwd,
-            defaultTimeout,
-            signal,
-            (text) =>
-              onUpdate?.({
-                content: [{ type: "text", text }],
-              }),
-          );
-        } else {
-          result = await runPiSubagent(
-            agent,
-            task,
-            ctx.cwd,
-            systemPrompt,
-            { max_tokens: config.defaults?.max_tokens },
-            signal,
-            (text) =>
-              onUpdate?.({
-                content: [{ type: "text", text }],
-              }),
+        const primary = await buildRuntime(
+          agent,
+          agent.name,
+          subagentsDir,
+          defaults,
+        );
+        const fallbacks: SubagentRuntime[] = [];
+        for (const fb of agent.fallback ?? []) {
+          fallbacks.push(
+            await buildRuntime(fb, agent.name, subagentsDir, defaults),
           );
         }
+
+        const result = await runWithFallback(
+          primary,
+          fallbacks,
+          agentName,
+          task,
+          ctx.cwd,
+          defaults.timeout ?? 120,
+          signal,
+          (text) =>
+            onUpdate?.({
+              content: [{ type: "text", text }],
+            }),
+        );
 
         return {
           content: [
@@ -745,13 +1094,14 @@ export default async function (pi: ExtensionAPI) {
 
       // Parallel mode
       const tasks = params.tasks!.slice(0, 8);
-      // Shared progress state — populated by runParallel as results complete
-      const progress: (SubagentResult | undefined)[] = new Array(tasks.length).fill(undefined);
+      const progress: (SubagentResult | undefined)[] = new Array(
+        tasks.length,
+      ).fill(undefined);
       const results = await runParallel(
         tasks,
         config,
-        ctx.cwd,
-        configPath,
+        subagentsDir,
+        defaults,
         signal,
         (index, text) => {
           onUpdate?.({
