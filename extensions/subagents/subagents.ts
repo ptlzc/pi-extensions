@@ -473,6 +473,12 @@ function writePromptToTempFile(
   return { dir, filePath };
 }
 
+function formatCommandLine(command: string, args: string[]): string {
+  return [command, ...args.map((a) =>
+    a.includes(" ") || a.includes("{") ? `"${a}"` : a,
+  )].join(" ");
+}
+
 interface PiRunResult {
   exitCode: number;
   output: string;
@@ -525,9 +531,10 @@ async function runPiOnce(
 
   return new Promise<PiRunResult>((resolve) => {
     const invocation = getPiInvocation(args);
-    console.error(
-      `[subagents] spawn: ${invocation.command} ${invocation.args.map((a) => a.includes(" ") ? `"${a}"` : a).join(" ")}`,
-    );
+    const cmdLine = formatCommandLine(invocation.command, invocation.args);
+    console.error(`[subagents] ${cmdLine}`);
+    // Show the command in the TUI via onUpdate
+    onUpdate?.(`$ ${cmdLine}\n\n(running...)`);
     const proc = spawn(invocation.command, invocation.args, {
       cwd,
       shell: false,
@@ -650,9 +657,9 @@ async function runCliOnce(
   );
 
   return new Promise<PiRunResult>((resolve) => {
-    console.error(
-      `[subagents] spawn: ${runtime.command} ${args.map((a) => a.includes(" ") ? `"${a}"` : a).join(" ")}`,
-    );
+    const cmdLine = formatCommandLine(runtime.command!, args);
+    console.error(`[subagents] ${cmdLine}`);
+    onUpdate?.(`$ ${cmdLine}\n\n(running...)`);
     const proc = spawn(runtime.command!, args, {
       cwd: agentCwd,
       shell: false,
