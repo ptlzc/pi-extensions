@@ -1,0 +1,215 @@
+# pi-extensions subagents 配置
+#
+# 5 个 subagent (与 alpha_miner 相同的编排架构):
+#   explorer       — 探索者: 分析现有 extension 代码, 检索结构
+#   planner        — 规划者: 制定 extension 开发/重构计划
+#   executor-coder — 代码执行者: TDD 模式编写 extension TS 代码
+#   executor-writer — 文档执行者: 更新 README / AGENTS.md
+#   checker        — 检查者: 验证 extension 功能和文档完整性
+
+subagents:
+  # ============================================================
+  # 1. Explorer — 探索者
+  # ============================================================
+  - name: explorer
+    description: |
+      探索者. 分析现有 extension 代码结构, 检索 Pi ExtensionAPI 用法, 返回压缩上下文.
+      用于: 理解现有 extension 架构, 查找相关模式, 评估改动影响范围.
+    type: pi
+    model: ai-relay/gpt-5.2
+    thinking: high
+    tools:
+      - read
+      - grep
+      - find
+      - ls
+      - bash
+    prompt: prompts/explorer.j2
+    prompt_input:
+      project_root: /root/pi-extensions
+      extensions:
+        - filter-skills
+        - outline
+        - subagents
+    fallback:
+      - type: pi
+        model: ai-relay/gpt-5.2
+        thinking: high
+        tools: [read, grep, find, ls]
+        prompt: prompts/explorer.j2
+        prompt_input:
+          project_root: /root/pi-extensions
+          extensions:
+            - filter-skills
+            - outline
+            - subagents
+
+  # ============================================================
+  # 2. Planner — 规划者
+  # ============================================================
+  - name: planner
+    description: |
+      规划者. 根据探索结果制定 extension 开发或重构计划.
+      用于: 拆分任务, 确定执行顺序, 分配给 executor-coder 或 executor-writer.
+    type: pi
+    model: ai-relay/gpt-5.2
+    thinking: high
+    tools:
+      - read
+      - grep
+      - find
+      - ls
+    prompt: prompts/planner.j2
+    prompt_input:
+      project_root: /root/pi-extensions
+      tdd_required: true
+      doc_governance: true
+    fallback:
+      - type: pi
+        model: ai-relay/gpt-5.2
+        thinking: high
+        tools: [read, grep, find, ls]
+        prompt: prompts/planner.j2
+        prompt_input:
+          project_root: /root/pi-extensions
+          tdd_required: true
+          doc_governance: true
+
+  # ============================================================
+  # 3. Executor-Coder — 代码执行者 (TDD)
+  # ============================================================
+  - name: executor-coder
+    description: |
+      代码执行者. 根据计划执行 extension TypeScript 代码变更, 使用 TDD 模式.
+      遵守 Pi extension 约定: default export factory, ExtensionAPI, typebox 参数.
+    type: pi
+    model: ai-relay/gpt-5.2
+    thinking: high
+    tools:
+      - read
+      - grep
+      - find
+      - ls
+      - bash
+      - edit
+      - write
+    prompt: prompts/executor-coder.j2
+    prompt_input:
+      project_root: /root/pi-extensions
+      tdd_mode: true
+      language_constraints:
+        all_extensions: "TypeScript, no build step, Pi loads .ts directly"
+        patterns: "default export async function (pi: ExtensionAPI), pi.registerTool(), typebox Type.Object for params"
+        dependencies: "yaml, nunjucks, @colbymchenry/codegraph (root package.json)"
+      validation_commands:
+        install: "pi remove git:github.com/ptlzc/pi-extensions && pi install git:github.com/ptlzc/pi-extensions"
+        test: "pi -p 'Use the <tool-name> tool with ...' --no-session -a"
+    fallback:
+      - type: pi
+        model: ai-relay/gpt-5.2
+        thinking: high
+        tools: [read, grep, find, ls, bash, edit, write]
+        prompt: prompts/executor-coder.j2
+        prompt_input:
+          project_root: /root/pi-extensions
+          tdd_mode: true
+          language_constraints:
+            all_extensions: "TypeScript, no build step, Pi loads .ts directly"
+            patterns: "default export async function (pi: ExtensionAPI), pi.registerTool(), typebox Type.Object for params"
+            dependencies: "yaml, nunjucks, @colbymchenry/codegraph (root package.json)"
+          validation_commands:
+            install: "pi remove git:github.com/ptlzc/pi-extensions && pi install git:github.com/ptlzc/pi-extensions"
+            test: "pi -p 'Use the <tool-name> tool with ...' --no-session -a"
+
+  # ============================================================
+  # 4. Executor-Writer — 文档执行者
+  # ============================================================
+  - name: executor-writer
+    description: |
+      文档执行者. 根据计划执行文档变更 (README.md, AGENTS.md).
+      遵守项目文档约定: 每个 extension 有独立 README, 根 AGENTS.md 记录结构约定.
+    type: pi
+    model: ai-relay/gpt-5.2
+    thinking: high
+    tools:
+      - read
+      - grep
+      - find
+      - ls
+      - bash
+      - edit
+      - write
+    prompt: prompts/executor-writer.j2
+    prompt_input:
+      project_root: /root/pi-extensions
+      doc_structure:
+        - file: "AGENTS.md"
+          content: "项目结构约定, extension 开发规范"
+        - file: "extensions/<name>/README.md"
+          content: "每个 extension 的独立文档: 功能, 安装, 用法, 配置"
+        - file: "extensions/<name>/package.json"
+          content: "npm 元数据 + pi manifest"
+      language: en
+    fallback:
+      - type: pi
+        model: ai-relay/gpt-5.2
+        thinking: high
+        tools: [read, grep, find, ls, bash, edit, write]
+        prompt: prompts/executor-writer.j2
+        prompt_input:
+          project_root: /root/pi-extensions
+          doc_structure:
+            - file: "AGENTS.md"
+              content: "项目结构约定, extension 开发规范"
+            - file: "extensions/<name>/README.md"
+              content: "每个 extension 的独立文档: 功能, 安装, 用法, 配置"
+            - file: "extensions/<name>/package.json"
+              content: "npm 元数据 + pi manifest"
+          language: en
+
+  # ============================================================
+  # 5. Checker — 检查者
+  # ============================================================
+  - name: checker
+    description: |
+      检查者. 对比 plan + executor 前后结果, 验证 extension 功能和文档完整性.
+      用于: 检查代码是否符合计划, extension 是否可正常加载, 文档是否同步.
+    type: pi
+    model: ai-relay/gpt-5.2
+    thinking: high
+    tools:
+      - read
+      - grep
+      - find
+      - ls
+      - bash
+    prompt: prompts/checker.j2
+    prompt_input:
+      project_root: /root/pi-extensions
+      check_dimensions:
+        - "代码变更是否符合 plan"
+        - "extension 可正常加载 (pi install 后无报错)"
+        - "工具注册正确 (registerTool name/parameters/execute)"
+        - "文档同步 (README.md / AGENTS.md)"
+        - "无遗留技术债 (未使用依赖, 死代码)"
+        - "TypeScript 类型正确 (typebox 参数定义)"
+    fallback:
+      - type: pi
+        model: ai-relay/gpt-5.2
+        thinking: high
+        tools: [read, grep, find, ls, bash]
+        prompt: prompts/checker.j2
+        prompt_input:
+          project_root: /root/pi-extensions
+          check_dimensions:
+            - "代码变更是否符合 plan"
+            - "extension 可正常加载"
+            - "工具注册正确"
+            - "文档同步"
+            - "无遗留技术债"
+
+defaults:
+  timeout: 600
+  thinking: high
+  skills:
+    - /root/.agents/skills/se-structuralization-reader/SKILL.md
