@@ -60,6 +60,7 @@ interface SubagentConfig {
   thinking?: ThinkingLevel;
   max_context?: number;
   tools?: string[];
+  skills?: string[]; // skill file paths to load via --skill
 
   // CLI-type
   command?: string;
@@ -78,6 +79,7 @@ interface FallbackConfig {
   thinking?: ThinkingLevel;
   max_context?: number;
   tools?: string[];
+  skills?: string[];
   prompt?: string;
   prompt_input?: Record<string, unknown>;
   // CLI-type
@@ -92,6 +94,7 @@ interface SubagentsConfig {
   defaults?: {
     timeout?: number;
     thinking?: ThinkingLevel;
+    skills?: string[];
   };
 }
 
@@ -101,6 +104,7 @@ interface SubagentRuntime {
   thinking?: ThinkingLevel;
   max_context?: number;
   tools?: string[];
+  skills?: string[];
   systemPrompt: string;
   command?: string;
   args?: string[];
@@ -415,7 +419,7 @@ async function buildRuntime(
   config: SubagentConfig | FallbackConfig,
   name: string,
   subagentsDir: string,
-  defaults: { timeout?: number; thinking?: ThinkingLevel },
+  defaults: { timeout?: number; thinking?: ThinkingLevel; skills?: string[] },
 ): Promise<SubagentRuntime> {
   const prompt = await resolvePrompt(
     config.prompt,
@@ -424,12 +428,18 @@ async function buildRuntime(
     name,
   );
 
+  // Merge skills: config-level skills + defaults-level skills (deduped)
+  const configSkills = config.skills ?? [];
+  const defaultSkills = defaults.skills ?? [];
+  const skills = [...new Set([...configSkills, ...defaultSkills])];
+
   return {
     type: config.type,
     model: config.model,
     thinking: config.thinking ?? defaults.thinking,
     max_context: config.max_context,
     tools: config.tools,
+    skills: skills.length > 0 ? skills : undefined,
     systemPrompt: prompt,
     command: config.command,
     args: config.args,
@@ -495,6 +505,13 @@ async function runPiOnce(
 
   if (runtime.tools && runtime.tools.length > 0) {
     args.push("--tools", runtime.tools.join(","));
+  }
+
+  // Load skill files via --skill (can be used multiple times)
+  if (runtime.skills && runtime.skills.length > 0) {
+    for (const skillPath of runtime.skills) {
+      args.push("--skill", skillPath);
+    }
   }
 
   let tmpDir: string | null = null;
@@ -804,7 +821,7 @@ async function runParallel(
   items: { agent: string; task: string }[],
   config: SubagentsConfig,
   subagentsDir: string,
-  defaults: { timeout?: number; thinking?: ThinkingLevel },
+  defaults: { timeout?: number; thinking?: ThinkingLevel; skills?: string[] },
   signal: AbortSignal | undefined,
   onUpdate: ((index: number, text: string) => void) | undefined,
   onComplete:
@@ -999,6 +1016,7 @@ export default async function (pi: ExtensionAPI) {
       const defaults = {
         timeout: config.defaults?.timeout ?? 120,
         thinking: config.defaults?.thinking,
+        skills: config.defaults?.skills,
       };
 
       if (config.subagents.length === 0) {
