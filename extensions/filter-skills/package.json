@@ -1,0 +1,15 @@
+{
+  "name": "@ptlzc/pi-filter-skills",
+  "version": "0.1.0",
+  "description": "Project-level skill filtering extension for Pi coding agent",
+  "keywords": ["pi-package", "pi-extension"],
+  "license": "MIT",
+  "type": "module",
+  "main": "filter-skills.ts",
+  "pi": {
+    "extensions": ["./filter-skills.ts"]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.79.0"
+  }
+}
