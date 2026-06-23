@@ -6,12 +6,14 @@
   "license": "MIT",
   "dependencies": {
     "yaml": "^2.9.0",
-    "nunjucks": "^3.2.4"
+    "nunjucks": "^3.2.4",
+    "@colbymchenry/codegraph": "^1.0.1"
   },
   "pi": {
     "extensions": [
       "./extensions/filter-skills",
-      "./extensions/subagents"
+      "./extensions/subagents",
+      "./extensions/outline"
     ]
   }
 }

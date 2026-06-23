@@ -1,0 +1,10 @@
+{
+  "name": "@ptlzc/pi-ext-outline",
+  "version": "0.1.0",
+  "description": "Structural outline tool for Pi — markdown headings + codegraph source outline",
+  "keywords": ["pi-extension"],
+  "license": "MIT",
+  "dependencies": {
+    "@colbymchenry/codegraph": "^1.0.1"
+  }
+}
