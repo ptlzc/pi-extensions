@@ -13,7 +13,8 @@
     "extensions": [
       "./extensions/filter-skills",
       "./extensions/subagents",
-      "./extensions/outline"
+      "./extensions/outline",
+      "./extensions/skill-autocomplete"
     ]
   }
 }

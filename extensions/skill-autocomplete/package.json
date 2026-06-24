@@ -1,0 +1,15 @@
+{
+  "name": "@ptlzc/pi-skill-autocomplete",
+  "version": "0.1.0",
+  "description": "Slash-triggered skills autocomplete for Pi coding agent — typing / shows the skills list",
+  "keywords": ["pi-package", "pi-extension"],
+  "license": "MIT",
+  "type": "module",
+  "main": "skill-autocomplete.ts",
+  "pi": {
+    "extensions": ["./skill-autocomplete.ts"]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.79.0"
+  }
+}
