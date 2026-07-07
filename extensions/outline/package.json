@@ -1,10 +1,8 @@
 {
   "name": "@ptlzc/pi-ext-outline",
-  "version": "0.1.0",
-  "description": "Structural outline tool for Pi — markdown headings + codegraph source outline",
+  "version": "0.2.0",
+  "description": "Structural outline tool for Pi — markdown headings + YAML keys + tree-sitter source outline via Rust binary",
   "keywords": ["pi-extension"],
   "license": "MIT",
-  "dependencies": {
-    "@colbymchenry/codegraph": "^1.0.1"
-  }
+  "dependencies": {}
 }

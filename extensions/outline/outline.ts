@@ -1,20 +1,53 @@
 /**
  * outline — Structural outline tool for Pi
  *
- * Generates file structure outlines (functions, classes, sections with line
- * numbers) to enable precise line-range reads instead of whole-file reads.
+ * Generates file structure outlines (functions, classes, sections, YAML keys,
+ * Markdown headings) with 1-based line ranges to enable precise line-range
+ * reads instead of whole-file reads.
  *
- * Two paths:
+ * Three paths:
  *   - Markdown (.md, .markdown, .md.j2, .j2): regex-based heading parser
- *   - Source code: codegraph SDK (tree-sitter WASM) via extractFromSource
+ *   - YAML (.yaml, .yml): indentation-based key/sequence/document parser
+ *   - Source code: Rust `devin-tools-mock` binary (tree-sitter AST, zero deps)
  *
  * Recommended first step for files >200 lines.
  */
 
 import { readFileSync, existsSync, statSync } from "node:fs";
-import { resolve, extname, basename } from "node:path";
+import { execFileSync } from "node:child_process";
+import { resolve, extname, basename, join } from "node:path";
+import { homedir } from "node:os";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface OutlineEntry {
+  depth: number;
+  kind: string;
+  name: string;
+  line: number;
+  end_line: number;
+}
+
+// ---------------------------------------------------------------------------
+// File classification
+// ---------------------------------------------------------------------------
+
+const MARKDOWN_EXTS = new Set([".md", ".markdown", ".md.j2", ".markdown.j2", ".j2"]);
+const YAML_EXTS = new Set([".yaml", ".yml"]);
+
+function classify(filePath: string): "markdown" | "yaml" | "source" {
+  const ext = extname(filePath).toLowerCase();
+  const name = basename(filePath).toLowerCase();
+  if (MARKDOWN_EXTS.has(ext) || name.endsWith(".md.j2") || name.endsWith(".markdown.j2")) {
+    return "markdown";
+  }
+  if (YAML_EXTS.has(ext)) return "yaml";
+  return "source";
+}
 
 // ---------------------------------------------------------------------------
 // Markdown outline (pure regex, no deps)
@@ -23,24 +56,16 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const HEADING_RE = /^( {0,3})(#{1,6})(?:[ \t]+|$)(.*)$/;
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
 
-interface MdHeading {
-  level: number;
-  title: string;
-  line: number;
-  endLine: number;
-  children: MdHeading[];
-}
-
-function parseMarkdownHeadings(lines: string[]): MdHeading[] {
-  const roots: MdHeading[] = [];
-  const stack: MdHeading[] = [];
+function outlineMarkdown(lines: string[], maxDepth?: number): OutlineEntry[] {
+  const entries: OutlineEntry[] = [];
+  const stack: { level: number; idx: number }[] = [];
   let inFence = false;
   let fenceChar = "";
   let fenceLen = 0;
   const total = lines.length;
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].replace(/\r?\n$/, "");
+    const line = lines[i];
     const fenceMatch = line.match(FENCE_RE);
     if (fenceMatch) {
       const marker = fenceMatch[1];
@@ -52,8 +77,6 @@ function parseMarkdownHeadings(lines: string[]): MdHeading[] {
         fenceLen = len;
       } else if (char === fenceChar && len >= fenceLen) {
         inFence = false;
-        fenceChar = "";
-        fenceLen = 0;
       }
       continue;
     }
@@ -61,277 +84,154 @@ function parseMarkdownHeadings(lines: string[]): MdHeading[] {
 
     const match = line.match(HEADING_RE);
     if (!match) continue;
-
     const level = match[2].length;
-    let title = match[3].trim();
-    // Strip trailing # marks
-    title = title.replace(/[ \t]+#{1,}[ \t]*$/, "").trim();
+    if (maxDepth !== undefined && level > maxDepth) continue;
+    let title = match[3].trim().replace(/[ \t]+#{1,}[ \t]*$/, "").trim();
 
     while (stack.length > 0 && stack[stack.length - 1].level >= level) {
-      stack[stack.length - 1].endLine = i;
-      stack.pop();
+      const top = stack.pop()!;
+      if (entries[top.idx].end_line === total) {
+        entries[top.idx].end_line = Math.max(i, entries[top.idx].line);
+      }
     }
 
-    const heading: MdHeading = {
-      level,
-      title,
-      line: i + 1,
-      endLine: total,
-      children: [],
-    };
-
-    if (stack.length > 0) {
-      stack[stack.length - 1].children.push(heading);
-    } else {
-      roots.push(heading);
-    }
-    stack.push(heading);
+    const depth = stack.length;
+    const idx = entries.length;
+    entries.push({ depth, kind: "heading", name: title, line: i + 1, end_line: total });
+    stack.push({ level, idx });
   }
-
-  for (const h of stack) h.endLine = total;
-  return roots;
-}
-
-function renderMarkdownOutline(headings: MdHeading[], depth = 0): string[] {
-  const rows: string[] = [];
-  const prefix = "  ".repeat(depth);
-  for (const h of headings) {
-    const marks = "#".repeat(h.level);
-    rows.push(`${prefix}${marks} ${h.title} [${h.line},${h.endLine}]`);
-    rows.push(...renderMarkdownOutline(h.children, depth + 1));
-  }
-  return rows;
+  return entries;
 }
 
 // ---------------------------------------------------------------------------
-// Source code outline (codegraph SDK)
+// YAML outline (indentation-based, no deps)
 // ---------------------------------------------------------------------------
 
-const MARKDOWN_EXTS = new Set([
-  ".md", ".markdown", ".md.j2", ".markdown.j2", ".j2",
-]);
+function outlineYaml(lines: string[], maxDepth?: number): OutlineEntry[] {
+  const entries: OutlineEntry[] = [];
+  const stack: { indent: number; idx: number }[] = [];
 
-// Source kinds we care about (subset of codegraph NODE_KINDS)
-const SOURCE_KINDS = new Set([
-  "class", "component", "enum", "function", "interface", "method",
-  "module", "namespace", "protocol", "record", "route", "struct",
-  "trait", "type_alias",
-]);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === "" || line.trim().startsWith("#")) continue;
 
-// Lazy-loaded codegraph SDK
-let cgSdk: any = null;
-let cgInitPromise: Promise<any> | null = null;
+    // Document marker
+    if (line.trim() === "---" || line.trim() === "...") {
+      while (stack.length > 0) stack.pop();
+      entries.push({ depth: 0, kind: "document", name: line.trim(), line: i + 1, end_line: i + 1 });
+      continue;
+    }
 
-async function getCodegraphSdk(): Promise<any> {
-  if (cgSdk) return cgSdk;
-  if (cgInitPromise) return cgInitPromise;
+    const indent = line.length - line.trimStart().length;
+    const trimmed = line.slice(indent);
 
-  cgInitPromise = (async () => {
-    const mod = await import("@colbymchenry/codegraph");
-    cgSdk = mod.default || mod;
-    return cgSdk;
-  })();
+    // Sequence item
+    if (trimmed.startsWith("- ")) {
+      const rest = trimmed.slice(2).trim();
+      const keyMatch = rest.match(/^([^:]+):\s*(.*)$/);
+      const name = keyMatch ? `- ${keyMatch[1].trim()}` : `- ${rest.split(":")[0].trim() || rest}`;
+      while (stack.length > 0 && stack[stack.length - 1].indent >= indent) stack.pop();
+      const depth = stack.length;
+      if (maxDepth !== undefined && depth >= maxDepth) continue;
+      entries.push({ depth, kind: "sequence-key", name, line: i + 1, end_line: i + 1 });
+      continue;
+    }
 
-  return cgInitPromise;
+    // Key: value
+    const keyMatch = trimmed.match(/^("?[^":]+"?):\s*(.*)$/);
+    if (keyMatch) {
+      let key = keyMatch[1].replace(/"/g, "").trim();
+      const value = keyMatch[2].trim();
+      while (stack.length > 0 && stack[stack.length - 1].indent >= indent) stack.pop();
+      const depth = stack.length;
+      if (maxDepth !== undefined && depth >= maxDepth) continue;
+      const kind = value === "" ? "key" : "leaf";
+      entries.push({ depth, kind, name: key, line: i + 1, end_line: i + 1 });
+      if (value === "") {
+        stack.push({ indent: indent + 2, idx: entries.length - 1 });
+      }
+    }
+  }
+  return entries;
 }
 
-interface SourceNode {
-  kind: string;
-  name: string;
-  startLine: number;
-  endLine: number;
-  children: SourceNode[];
+// ---------------------------------------------------------------------------
+// Source code outline (Rust binary — tree-sitter AST)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_BIN = join(homedir(), ".pi", "agent", "bin", "devin-tools-mock");
+
+function binaryPath(): string {
+  return process.env.DEVIN_TOOLS_MOCK_BIN || DEFAULT_BIN;
 }
 
-function buildSourceHierarchy(
-  rawNodes: any[],
-  relPath: string,
-): SourceNode[] {
-  // Filter to relevant kinds in this file
-  const candidates = rawNodes
-    .filter((n) =>
-      SOURCE_KINDS.has(n.kind) &&
-      typeof n.startLine === "number" &&
-      typeof n.endLine === "number" &&
-      typeof n.name === "string" &&
-      (n.filePath === relPath || n.path === relPath || !n.filePath),
-    )
-    .sort((a, b) => {
-      const startDiff = a.startLine - b.startLine;
-      if (startDiff !== 0) return startDiff;
-      return (b.endLine - b.startLine) - (a.endLine - a.startLine);
+function outlineSourceCli(absFilePath: string, maxDepth?: number): OutlineEntry[] | null {
+  const bin = binaryPath();
+  if (!existsSync(bin)) return null;
+
+  const input: Record<string, unknown> = { file_path: absFilePath };
+  if (maxDepth !== undefined) input.max_depth = maxDepth;
+
+  try {
+    const stdout = execFileSync(bin, ["outline"], {
+      input: JSON.stringify(input),
+      encoding: "utf8",
+      timeout: 30000,
+      maxBuffer: 10 * 1024 * 1024,
     });
-
-  const roots: SourceNode[] = [];
-  const stack: SourceNode[] = [];
-
-  for (const raw of candidates) {
-    const start = raw.startLine;
-    const end = Math.max(raw.endLine, start);
-    const node: SourceNode = {
-      kind: raw.kind,
-      name: raw.name,
-      startLine: start,
-      endLine: end,
-      children: [],
-    };
-
-    while (stack.length > 0 && !contains(stack[stack.length - 1], node)) {
-      stack.pop();
-    }
-
-    if (stack.length > 0) {
-      stack[stack.length - 1].children.push(node);
-    } else {
-      roots.push(node);
-    }
-    stack.push(node);
+    const output = JSON.parse(stdout) as { entries: OutlineEntry[] };
+    return output.entries;
+  } catch {
+    return null;
   }
-
-  return roots;
 }
 
-function contains(parent: SourceNode, child: SourceNode): boolean {
-  return (
-    parent.startLine <= child.startLine &&
-    parent.endLine >= child.endLine &&
-    (parent.startLine !== child.startLine || parent.endLine !== child.endLine)
-  );
-}
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
 
-function renderSourceOutline(nodes: SourceNode[], depth = 0): string[] {
-  const rows: string[] = [];
-  const prefix = "  ".repeat(depth);
-  for (const n of nodes) {
-    rows.push(`${prefix}${n.kind} ${n.name} [${n.startLine},${n.endLine}]`);
-    if (n.children.length > 0) {
-      rows.push(...renderSourceOutline(n.children, depth + 1));
-    }
-  }
-  return rows;
-}
-
-function findProjectRoot(filePath: string): string {
-  const { dirname } = require("node:path");
-  const { existsSync } = require("node:fs");
-  let dir = dirname(resolve(filePath));
-  const segments = dir.split("/");
-  while (segments.length > 1) {
-    const current = segments.join("/");
-    if (
-      existsSync(current + "/.git") ||
-      existsSync(current + "/.se") ||
-      existsSync(current + "/.codegraph")
-    ) {
-      return current;
-    }
-    segments.pop();
-  }
-  return dir;
+function renderOutline(entries: OutlineEntry[]): string {
+  return entries
+    .map((e) => `${"  ".repeat(e.depth)}${e.kind} ${e.name} [${e.line},${e.end_line}]`)
+    .join("\n");
 }
 
 // ---------------------------------------------------------------------------
 // Main outline function
 // ---------------------------------------------------------------------------
 
-async function generateOutline(filePath: string): Promise<string> {
+function generateOutline(filePath: string, maxDepth?: number): { kind: string; rendered: string; entryCount: number } {
   const absPath = resolve(filePath);
-  if (!existsSync(absPath)) {
-    throw new Error(`file not found: ${absPath}`);
-  }
-  if (!statSync(absPath).isFile()) {
-    throw new Error(`not a file: ${absPath}`);
-  }
+  if (!existsSync(absPath)) throw new Error(`file not found: ${absPath}`);
+  if (!statSync(absPath).isFile()) throw new Error(`not a file: ${absPath}`);
 
-  const ext = extname(absPath).toLowerCase();
-  const isMarkdown = MARKDOWN_EXTS.has(ext) ||
-    absPath.endsWith(".md.j2") ||
-    absPath.endsWith(".markdown.j2");
+  const kind = classify(absPath);
+  const raw = readFileSync(absPath, "utf8");
+  const lines = raw.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
 
-  if (isMarkdown) {
-    const content = readFileSync(absPath, "utf-8");
-    const lines = content.split("\n");
-    const headings = parseMarkdownHeadings(lines);
-    const rows = [`file ${absPath}`, ...renderMarkdownOutline(headings)];
-    return rows.filter((r) => r).join("\n");
-  }
+  let entries: OutlineEntry[];
 
-  // Source code: use codegraph SDK
-  const sdk = await getCodegraphSdk();
-  const projectRoot = findProjectRoot(absPath);
-
-  // Compute relative path
-  const relPath = absPath.startsWith(projectRoot + "/")
-    ? absPath.slice(projectRoot.length + 1)
-    : basename(absPath);
-
-  // Detect language
-  const lang = sdk.detectLanguage(relPath);
-  if (!lang || !sdk.isLanguageSupported(lang)) {
-    throw new Error(
-      `unsupported language for ${relPath} (detected: ${lang || "none"}). ` +
-      `Supported: ${sdk.getSupportedLanguages().join(", ")}`,
-    );
-  }
-
-  // Initialize grammar runtime + load specific language grammar
-  await sdk.initGrammars();
-  if (!sdk.isGrammarLoaded(lang)) {
-    await sdk.loadGrammarsForLanguages([lang]);
-  }
-
-  // Read source
-  const src = readFileSync(absPath, "utf-8");
-
-  // Set codegraph dir
-  const codegraphDir =
-    existsSync(projectRoot + "/.se") ? ".se" :
-    existsSync(projectRoot + "/.codegraph") ? ".codegraph" : ".se";
-  process.env.CODEGRAPH_DIR = codegraphDir;
-
-  // Get or create CodeGraph instance
-  let cg: any;
-  try {
-    if (sdk.CodeGraph.isInitialized(projectRoot)) {
-      cg = sdk.CodeGraph.openSync(projectRoot);
-    } else {
-      cg = sdk.CodeGraph.initSync(projectRoot);
+  switch (kind) {
+    case "markdown":
+      entries = outlineMarkdown(lines, maxDepth);
+      break;
+    case "yaml":
+      entries = outlineYaml(lines, maxDepth);
+      break;
+    case "source": {
+      const cliEntries = outlineSourceCli(absPath, maxDepth);
+      entries = cliEntries ?? [];
+      break;
     }
-  } catch {
-    // Stale DB — remove and reinit
-    try {
-      const dbFile = projectRoot + "/" + codegraphDir + "/codegraph.db";
-      const fs = require("node:fs");
-      fs.rmSync(dbFile, { force: true });
-    } catch {}
-    cg = sdk.CodeGraph.initSync(projectRoot);
   }
 
-  try {
-    const result = cg.extractFromSource(relPath, src);
-    const rawNodes = Array.isArray(result.nodes) ? result.nodes : [];
+  const rendered =
+    entries.length === 0
+      ? `outline: no structure detected in ${absPath} (kind=${kind}, ${lines.length} lines).`
+      : `outline of ${absPath} (${kind}, ${lines.length} lines, ${entries.length} entries):\n${renderOutline(entries)}`;
 
-    if (rawNodes.length === 0) {
-      const errors = Array.isArray(result.errors) ? result.errors : [];
-      if (errors.length > 0) {
-        const firstErr = errors[0];
-        const msg = typeof firstErr === "object" ? firstErr.message : String(firstErr);
-        throw new Error(`codegraph parse error: ${msg}`);
-      }
-      // No nodes and no errors — return minimal outline
-      return `file ${absPath}\n(no structural elements found)`;
-    }
-
-    const hierarchy = buildSourceHierarchy(rawNodes, relPath);
-    if (hierarchy.length === 0) {
-      return `file ${absPath}\n(no functions/classes/interfaces found)`;
-    }
-
-    const rows = [`file ${absPath}`, ...renderSourceOutline(hierarchy)];
-    return rows.filter((r) => r).join("\n");
-  } finally {
-    cg.close();
-  }
+  return { kind, rendered, entryCount: entries.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -339,9 +239,14 @@ async function generateOutline(filePath: string): Promise<string> {
 // ---------------------------------------------------------------------------
 
 const OutlineParams = Type.Object({
-  file: Type.String({
-    description: "Absolute or relative path to the file to outline.",
+  file_path: Type.String({
+    description: "The absolute path to the file to outline. Must be absolute, not relative.",
   }),
+  max_depth: Type.Optional(
+    Type.Integer({
+      description: "Optional maximum nesting depth to include (1 = top-level only). Defaults to unlimited.",
+    }),
+  ),
 });
 
 export default async function (pi: ExtensionAPI) {
@@ -349,28 +254,34 @@ export default async function (pi: ExtensionAPI) {
     name: "outline",
     label: "Outline",
     description: [
-      "Generate a structural outline of a file (functions, classes, sections with line numbers).",
-      "Recommended first step before reading files >200 lines — use the outline to identify exact line ranges, then read only those ranges.",
-      "Markdown (.md/.j2): heading hierarchy with line ranges.",
-      "Source code: codegraph SDK (tree-sitter) — supports TypeScript, JavaScript, Python, Go, Rust, Java, C#, C/C++, Ruby, Swift, Kotlin, and more.",
-      "Output format: 'kind name [startLine,endLine]' with indentation for nesting.",
+      "Generates a structural outline of a file (functions, classes, sections,",
+      "YAML keys, Markdown headings) with 1-based line ranges. Use this before",
+      "reading a large file to locate the exact line range you need, then call",
+      "`read` with offset/limit. Supports Markdown (.md), YAML (.yaml/.yml), and",
+      "source code (.py, .rs, .ts, .js, .go, .java, .c, .cpp, .h, .rb, .sh, etc.).",
+      "The file_path parameter must be an absolute path.",
     ].join(" "),
 
     parameters: OutlineParams,
 
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const filePath = resolve(ctx.cwd, params.file);
-
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       try {
-        const outline = await generateOutline(filePath);
+        const input = params as { file_path: string; max_depth?: number };
+        if (!input?.file_path) {
+          return {
+            content: [{ type: "text", text: "outline: missing required parameter `file_path`." }],
+            isError: true,
+          };
+        }
+        const result = generateOutline(input.file_path, input.max_depth);
         return {
-          content: [{ type: "text", text: outline }],
+          content: [{ type: "text", text: result.rendered }],
         };
       } catch (err: any) {
         return {
           content: [{
             type: "text",
-            text: `outline error: ${err.message || err}\n\nTip: use native read with offset/limit for small files or unsupported file types.`,
+            text: `outline failed: ${err.message || err}`,
           }],
           isError: true,
         };

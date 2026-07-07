@@ -2,15 +2,33 @@
 
 Structural outline tool for [Pi](https://pi.dev) coding agent.
 
-Generates file structure outlines (functions, classes, sections with line numbers) to enable precise line-range reads instead of whole-file reads. **Recommended first step for files >200 lines.**
+Generates file structure outlines (functions, classes, sections, YAML keys,
+Markdown headings) with 1-based line ranges to enable precise line-range
+reads instead of whole-file reads. **Recommended first step for files >200
+lines.**
+
+## Architecture
+
+| file type | backend | dependencies |
+|-----------|---------|-------------|
+| Markdown  | pure TS (regex) | none |
+| YAML      | pure TS (indentation) | none |
+| Source    | Rust binary (tree-sitter AST) | `~/.pi/agent/bin/devin-tools-mock` |
+
+Source code outline is delegated to the Rust `devin-tools-mock` binary,
+which has tree-sitter grammars **compiled in** — zero runtime dependencies
+(no node/sqlite/npm packages).
 
 ## Features
 
-- **Markdown outline**: regex-based heading hierarchy parser (`.md`, `.markdown`, `.md.j2`, `.j2`)
-- **Source code outline**: codegraph SDK (tree-sitter WASM) via `extractFromSource`
-- **26 languages**: TypeScript, JavaScript, Python, Go, Rust, Java, C#, C/C++, Ruby, Swift, Kotlin, Dart, PHP, Scala, Lua, R, and more
+- **Markdown outline**: regex-based heading hierarchy (`.md`, `.markdown`, `.md.j2`, `.j2`)
+- **YAML outline**: indentation-based key/sequence/document parser (`.yaml`, `.yml`)
+- **Source code outline**: tree-sitter AST via Rust binary
+- **11 languages**: Python, Rust, TypeScript, JavaScript, Go, Java, C, C++, Ruby, Bash, Lua
+- **Accurate nesting**: methods inside classes show as depth-1 children
+- **Rich kinds**: class, method, function, struct, trait, interface, enum, namespace, operator[], ~destructor
 - **Line ranges**: every node shows `[startLine,endLine]` for precise reads
-- **Hierarchy**: nested classes/methods shown with indentation
+- **max_depth**: optional parameter to limit nesting depth
 
 ## Install
 
@@ -18,68 +36,54 @@ Generates file structure outlines (functions, classes, sections with line number
 pi install git:github.com/ptlzc/pi-extensions
 ```
 
+The Rust binary must be at `~/.pi/agent/bin/devin-tools-mock`. Build it from
+the `devin-tools-mock` repo:
+
+```bash
+cd devin-tools-mock
+cargo build --release
+cp target/release/devin-tools-mock ~/.pi/agent/bin/
+```
+
+Override the binary path via `DEVIN_TOOLS_MOCK_BIN` env var if needed.
+
 ## Usage
 
-The `outline` tool is automatically available to Pi after installation.
-
 ```
-outline(file: "src/large-file.ts")
-```
-
-### Markdown output example
-
-```
-file README.md
-# Title [1,100]
-## Section A [5,30]
-### Subsection [10,20]
-## Section B [35,80]
+outline(file_path: "/abs/path/to/large-file.ts")
+outline(file_path: "/abs/path/to/config.yaml", max_depth: 2)
 ```
 
 ### Source code output example
 
 ```
-file src/auth.ts
+outline of /path/to/auth.ts (source, 95 lines, 4 entries):
 class AuthService [1,80]
   method login [5,25]
   method logout [27,35]
-  method validateToken [37,60]
 function hashPassword [82,95]
 ```
 
-## When to use
+### YAML output example
 
-| Scenario | Use outline? |
-|----------|-------------|
-| File >200 lines | Yes — outline first, then read specific ranges |
-| Markdown with multiple sections | Yes — cheap regex parsing |
-| Small file (<200 lines) | No — use native `read` directly |
-| Config files (.yaml/.json/.toml) | No — codegraph doesn't parse them |
-| Known exact line range | No — use native `read` with offset/limit |
+```
+outline of /path/to/docker-compose.yaml (yaml, 14 lines, 5 entries):
+key services [2,10]
+  key web [3,8]
+    leaf image [4,4]
+  key db [9,10]
+key networks [11,12]
+```
 
-## How it works
+### Markdown output example
 
-### Markdown path
-
-Pure regex parsing of `#`-prefixed headings, respecting fenced code blocks. No external dependencies. Outputs heading hierarchy with line ranges.
-
-### Source code path
-
-Uses `@colbymchenry/codegraph` SDK — a self-contained tree-sitter WASM based code intelligence library:
-
-1. `detectLanguage(filePath)` — identifies language from extension
-2. `initGrammars()` — initializes tree-sitter WASM runtime
-3. `loadGrammarsForLanguages([lang])` — loads the specific grammar
-4. `CodeGraph.extractFromSource(relPath, source)` — parses source text
-5. Filters to structural kinds (class, function, method, interface, etc.)
-6. Builds hierarchy from line-range containment
-7. Renders as indented text outline
-
-No persisted index required — `extractFromSource` parses source text directly.
-
-## Supported languages
-
-typescript, tsx, javascript, jsx, python, go, rust, java, c, cpp, csharp, php, ruby, swift, kotlin, dart, pascal, scala, lua, r, luau, objc, svelte, vue, astro, liquid
+```
+outline of /path/to/README.md (markdown, 100 lines, 4 entries):
+heading Title [1,100]
+  heading Section A [5,30]
+    heading Subsection [10,20]
+  heading Section B [35,80]
+```
 
 ## License
 
